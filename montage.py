@@ -10,14 +10,6 @@ def slugify(text: str) -> str:
     return re.sub(r'[^a-z0-9]+', '_', text.lower()).strip('_')
 
 
-def parse_query(query: str) -> tuple[str, str]:
-    m = re.match(r'^(.+?), using song (.+)$', query.strip())
-    if not m:
-        print("Query must be '<topic>, using song <song>'")
-        sys.exit(1)
-    return m.group(1).strip(), m.group(2).strip()
-
-
 def check_deps():
     for name in ("ffmpeg", "ffprobe", "yt-dlp"):
         if not subprocess.run(["which", name], capture_output=True).returncode:
@@ -425,7 +417,6 @@ def main():
     )
     parser.add_argument("--topic", "-t", help="Video topic to search")
     parser.add_argument("--song", "-s", help="Song for soundtrack")
-    parser.add_argument("query", nargs="?", help="'<topic>, using song <song>'")
     parser.add_argument("--init-csv", action="store_true", help="Create prompts.csv with 10 combos")
     parser.add_argument("--csv", help="Batch-process all entries in prompts.csv")
     args = parser.parse_args()
@@ -440,10 +431,6 @@ def main():
         return
     if args.topic and args.song:
         generate(args.topic, args.song)
-        return
-    if args.query:
-        topic, song = parse_query(args.query)
-        generate(topic, song)
         return
     parser.print_help()
 

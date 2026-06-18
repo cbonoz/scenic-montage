@@ -22,12 +22,6 @@ uv sync
 uv run montage.py --topic "boston trains" --song "for the heavens by axjunior"
 ```
 
-Or with the natural language query format:
-
-```bash
-uv run montage.py "boston trains, using song for the heavens by axjunior"
-```
-
 ### Batch processing
 
 Generate a CSV of 10 topic/song ideas:
