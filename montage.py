@@ -34,6 +34,40 @@ def get_dur(path: Path) -> float:
     return float(json.loads(r.stdout)["format"]["duration"])
 
 
+def probe_video(path: Path) -> dict:
+    r = subprocess.run([
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,codec_name",
+        str(path),
+    ], capture_output=True, text=True)
+    if r.returncode:
+        return {"width": 0, "height": 0}
+    streams = json.loads(r.stdout).get("streams", [])
+    return streams[0] if streams else {"width": 0, "height": 0}
+
+
+def clip_quality_score(info: dict) -> float:
+    w, h = info.get("width", 0) or 0, info.get("height", 0) or 0
+    if w == 0 or h == 0:
+        return -1
+    aspect = w / h
+    # prefer 16:9 landscape (1.78) — penalize vertical and extreme aspect ratios
+    if aspect < 1.2 or aspect > 2.0:
+        return -2
+    aspect_score = -abs(aspect - 16 / 9) * 10
+    res = min(w, h)
+    if res >= 1080:
+        res_score = 100
+    elif res >= 720:
+        res_score = 70
+    elif res >= 480:
+        res_score = 40
+    else:
+        return -3
+    return res_score + aspect_score
+
+
 def download_song(songs_dir: Path, song_query: str) -> Path:
     slug = slugify(song_query[:60])
     dst = songs_dir / f"{slug}.wav"
@@ -98,41 +132,137 @@ def pick_transitions(beats: list[float], n: int = 4) -> list[float]:
     return [beats[i] for i in idx]
 
 
+def flat_search(topic: str, n: int = 20) -> list[dict]:
+    queries = [f"{topic} cinematic", f"{topic} drone", f"{topic}"]
+    seen_ids = set()
+    results = []
+    for q in queries:
+        r = subprocess.run([
+            "yt-dlp", "--flat-playlist", "--dump-json", "--no-warnings",
+            "--playlist-items", f"1-{n}", f"ytsearch{n}:{q}",
+        ], capture_output=True, text=True, timeout=30)
+        if r.returncode:
+            continue
+        for line in r.stdout.strip().split("\n"):
+            if not line:
+                continue
+            d = json.loads(line)
+            if d.get("id") in seen_ids:
+                continue
+            seen_ids.add(d["id"])
+            results.append(d)
+    return results
+
+
+def deep_probe(videos: list[dict]) -> list[dict]:
+    urls = [f"https://www.youtube.com/watch?v={v['id']}" for v in videos]
+    r = subprocess.run([
+        "yt-dlp", "--dump-json", "--no-download", "--no-warnings",
+        *urls,
+    ], capture_output=True, text=True, timeout=120)
+    if r.returncode:
+        return []
+    enriched = {}
+    for line in r.stdout.strip().split("\n"):
+        if not line:
+            continue
+        d = json.loads(line)
+        enriched[d["id"]] = d
+    out = []
+    for v in videos:
+        if v["id"] in enriched:
+            out.append(enriched[v["id"]])
+        else:
+            out.append(v)
+    return out
+
+
+def rank_candidate(d: dict) -> float:
+    dur = d.get("duration") or 0
+    views = d.get("view_count") or 0
+    w = d.get("width") or 0
+    h = d.get("height") or 0
+
+    if dur < 20 or dur > 300:
+        return -1
+
+    if w and h:
+        aspect = w / h
+        if aspect < 1.2:
+            return -1
+        res = min(w, h)
+        if res >= 1080:
+            res_score = 100
+        elif res >= 720:
+            res_score = 70
+        elif res >= 480:
+            res_score = 40
+        else:
+            return -1
+        aspect_penalty = abs(aspect - 16 / 9) * 15
+        over2k = 20 if (w > 2560 or h > 1440) else 0
+    else:
+        res_score = 50
+        aspect_penalty = 0
+        over2k = 0
+
+    dur_penalty = max(0, dur - 90) * 0.3
+    view_bonus = min(views / 100_000, 10)
+    return res_score - aspect_penalty + view_bonus - dur_penalty - over2k
+
+
 def download_clips(project_dir: Path, topic: str, n: int = 5) -> list[Path]:
     d = project_dir / "clips"
     d.mkdir(exist_ok=True)
 
-    seen = sorted(d.glob("*.*"))
-    if len(seen) >= n:
-        print(f"  {len(seen)} clips cached")
-        return seen[:n]
+    cached = sorted(d.glob("*.*"))
+    if len(cached) >= n:
+        with_quality = [(clip_quality_score(probe_video(p)), p) for p in cached]
+        good = sorted([p for s, p in with_quality if s > 0], key=lambda p: -clip_quality_score(probe_video(p)))
+        if len(good) >= n:
+            print(f"  using {len(good)} cached clips")
+            return good[:n]
 
-    print(f"  downloading {n} clips: '{topic}'")
     for f in d.glob("*.part"):
         f.unlink(missing_ok=True)
 
-    fmt = "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]"
-    for attempt in range(2):
-        subprocess.run([
-            "yt-dlp", "-f", fmt, "--concurrent-fragments", "4",
-            "--max-downloads", str(n),
-            "-o", str(d / "clip_%(autonumber)02d.%(ext)s"),
-            f"ytsearch20:{topic}",
-        ], capture_output=True, text=True, timeout=300)
+    print(f"  scanning YouTube for best clips: '{topic}'")
+    flat = flat_search(topic)
+    pre_ranked = sorted([c for c in flat if rank_candidate(c) >= 0], key=rank_candidate, reverse=True)
+    print(f"  found {len(flat)} results, {len(pre_ranked)} usable (probing top {min(10, len(pre_ranked))})")
+    candidates = deep_probe(pre_ranked[:10]) if pre_ranked else []
+    ranked = sorted([c for c in candidates if rank_candidate(c) >= 0], key=rank_candidate, reverse=True)
 
-        clips = sorted(d.glob("*.*"))
-        if len(clips) >= 3:
-            break
-
-    clips = sorted(d.glob("*.*"))
-    if not clips:
-        print("  no videos found for topic")
+    if not ranked:
+        print("  no usable videos found (all too short, vertical, or low-res)")
         sys.exit(1)
 
-    print(f"  got {len(clips)} clips")
-    while len(clips) < n:
-        clips.append(clips[-1])
-    return clips[:n]
+    want = min(n + 3, len(ranked))
+    urls = [c.get("webpage_url") or f"https://www.youtube.com/watch?v={c['id']}" for c in ranked[:want]]
+
+    fmt = "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]"
+    print(f"  downloading top {len(urls)}...")
+    subprocess.run([
+        "yt-dlp", "-f", fmt, "--concurrent-fragments", "4",
+        "--max-filesize", "200M",
+        "--match-filter", "duration < 300",
+        "--no-warnings",
+        "-o", str(d / "clip_%(autonumber)02d.%(ext)s"),
+        *urls,
+    ], capture_output=True, text=True, timeout=600)
+
+    clips = sorted(d.glob("*.*"))
+    with_quality = [(clip_quality_score(probe_video(p)), p) for p in clips]
+    good = sorted([p for s, p in with_quality if s >= 0], key=lambda p: -clip_quality_score(probe_video(p)))
+
+    if len(good) < n:
+        print(f"  only {len(good)} landscape clips, padding with best available")
+        good = sorted(clips, key=lambda p: -clip_quality_score(probe_video(p)))
+
+    print(f"  using {min(n, len(good))} clips")
+    while len(good) < n:
+        good.append(good[-1])
+    return good[:n]
 
 
 def build_filter(clips: list[Path], trans: list[float], durs: list[float]) -> str:
