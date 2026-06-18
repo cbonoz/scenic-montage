@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[oc]
+*.egg-info/
+build/
+dist/
+
+# Virtual environment
+.venv/
+
+# Generated montage folders (each topic+song combo)
+# These contain downloaded clips, extracted audio, and final MP4s
+*__*/
+
+# Shared song cache
+songs/*.wav
+
+# macOS
+.DS_Store
