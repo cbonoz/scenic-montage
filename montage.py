@@ -44,7 +44,6 @@ def clip_quality_score(info: dict) -> float:
     if w == 0 or h == 0:
         return -1
     aspect = w / h
-    # prefer 16:9 landscape (1.78) — penalize vertical and extreme aspect ratios
     if aspect < 1.2 or aspect > 2.0:
         return -2
     aspect_score = -abs(aspect - 16 / 9) * 10
@@ -79,47 +78,48 @@ def download_song(songs_dir: Path, song_query: str) -> Path:
     return dst
 
 
-def find_energetic_30s(path: Path) -> float:
-    print("  finding best 30s segment...")
+def find_energetic_segment(path: Path, duration: float = 60.0) -> float:
+    print(f"  finding best {duration}s segment...")
     y, sr = librosa.load(str(path), sr=None, mono=True)
     dur = len(y) / sr
-    if dur <= 30:
+    if dur <= duration:
         return 0.0
     hop = 512
     rms = librosa.feature.rms(y=y, hop_length=hop)[0]
     rms_sr = sr / hop
-    wins = int(30 * rms_sr)
+    wins = int(duration * rms_sr)
     if wins >= len(rms):
         return 0.0
     pad_len = (wins - len(rms) % wins) % wins
     cum = np.cumsum(np.pad(rms, (0, pad_len)))
     sums = cum[wins:] - cum[:-wins]
     start = round(np.argmax(sums) / rms_sr)
-    return min(start, dur - 30)
+    return min(start, dur - duration)
 
 
-def extract_30s(src: Path, dst: Path, start: float):
+def extract_segment(src: Path, dst: Path, start: float, duration: float = 60.0):
     if dst.exists():
         return
     subprocess.run([
-        "ffmpeg", "-y", "-i", str(src), "-ss", str(start), "-t", "30",
+        "ffmpeg", "-y", "-i", str(src), "-ss", str(start), "-t", str(duration),
         "-acodec", "pcm_s16le", str(dst),
     ], capture_output=True, check=True)
 
 
-def detect_beats(path: Path) -> list[float]:
+def detect_beats(path: Path, duration: float = 60.0) -> list[float]:
     print("  detecting beats...")
     y, sr = librosa.load(str(path), sr=None, mono=True)
     tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
     bpm = float(np.asarray(tempo).item())
-    times = [t for t in librosa.frames_to_time(beats, sr=sr).tolist() if t < 30]
+    times = [t for t in librosa.frames_to_time(beats, sr=sr).tolist() if t < duration]
     print(f"  tempo: {bpm:.0f} BPM, {len(times)} beats")
     return times
 
 
-def pick_transitions(beats: list[float], n: int = 4) -> list[float]:
+def pick_transitions(beats: list[float], n: int = 7, duration: float = 60.0) -> list[float]:
     if len(beats) < n:
-        return [6, 12, 18, 24][:n]
+        step = duration / (n + 1)
+        return [round(step * (i + 1), 1) for i in range(n)]
     idx = [int((i + 1) * len(beats) / (n + 1)) for i in range(n)]
     return [beats[i] for i in idx]
 
@@ -169,7 +169,7 @@ def deep_probe(videos: list[dict]) -> list[dict]:
     return out
 
 
-def rank_candidate(d: dict) -> float:
+def rank_candidate(d: dict, topic_keywords: set | None = None) -> float:
     dur = d.get("duration") or 0
     views = d.get("view_count") or 0
     w = d.get("width") or 0
@@ -200,12 +200,24 @@ def rank_candidate(d: dict) -> float:
 
     dur_penalty = max(0, dur - 90) * 0.3
     view_bonus = min(views / 100_000, 10)
-    return res_score - aspect_penalty + view_bonus - dur_penalty - over2k
+
+    title_bonus = 0
+    if topic_keywords and d.get("title"):
+        low_title = d["title"].lower()
+        matches = sum(1 for kw in topic_keywords if kw in low_title)
+        if matches > 0:
+            title_bonus = matches * 15
+        else:
+            title_bonus = -30
+
+    return res_score - aspect_penalty + view_bonus - dur_penalty - over2k + title_bonus
 
 
-def download_clips(project_dir: Path, topic: str, n: int = 5) -> list[Path]:
+def download_clips(project_dir: Path, topic: str, n: int = 8) -> list[Path]:
     d = project_dir / "clips"
     d.mkdir(exist_ok=True)
+
+    topic_keywords = {kw for kw in topic.lower().split() if len(kw) > 2}
 
     cached = sorted(d.glob("*.*"))
     if len(cached) >= n:
@@ -220,10 +232,16 @@ def download_clips(project_dir: Path, topic: str, n: int = 5) -> list[Path]:
 
     print(f"  scanning YouTube for best clips: '{topic}'")
     flat = flat_search(topic)
-    pre_ranked = sorted([c for c in flat if rank_candidate(c) >= 0], key=rank_candidate, reverse=True)
+    pre_ranked = sorted(
+        [c for c in flat if rank_candidate(c, topic_keywords) >= 0],
+        key=lambda c: rank_candidate(c, topic_keywords), reverse=True,
+    )
     print(f"  found {len(flat)} results, {len(pre_ranked)} usable (probing top {min(10, len(pre_ranked))})")
     candidates = deep_probe(pre_ranked[:10]) if pre_ranked else []
-    ranked = sorted([c for c in candidates if rank_candidate(c) >= 0], key=rank_candidate, reverse=True)
+    ranked = sorted(
+        [c for c in candidates if rank_candidate(c, topic_keywords) >= 0],
+        key=lambda c: rank_candidate(c, topic_keywords), reverse=True,
+    )
 
     if not ranked:
         print("  no usable videos found (all too short, vertical, or low-res)")
@@ -257,7 +275,7 @@ def download_clips(project_dir: Path, topic: str, n: int = 5) -> list[Path]:
     return good[:n]
 
 
-def build_filter(clips: list[Path], trans: list[float], durs: list[float]) -> str:
+def build_filter(clips: list[Path], trans: list[float], durs: list[float], duration: float = 60.0) -> str:
     lines = []
     labels = []
     for i, (cp, dur) in enumerate(zip(clips, durs)):
@@ -279,19 +297,19 @@ def build_filter(clips: list[Path], trans: list[float], durs: list[float]) -> st
             f"format=yuv420p[{ol}]"
         )
         out = ol
-    fade_end = trans[-1] + 0.5 if trans else 29
+    fade_end = trans[-1] + 0.5 if trans else duration - 1
     lines.append(
         f"[{out}]fade=t=in:st=0:d=1,fade=t=out:st={fade_end}:d=1,"
         f"format=yuv420p[video]"
     )
     lines.append(
         f"[{len(clips)}:a]alimiter=limit=0.9,"
-        f"afade=t=in:st=0:d=1.5,afade=t=out:st=28.5:d=1.5[a]"
+        f"afade=t=in:st=0:d=1.5,afade=t=out:st={duration - 1.5}:d=1.5[a]"
     )
     return ";\n".join(lines)
 
 
-def generate(topic: str, song_query: str):
+def generate(topic: str, song_query: str, duration: float = 60.0):
     topic_slug = slugify(topic[:40])
     song_slug = slugify(song_query[:40])
     slug = f"{topic_slug}__{song_slug}"
@@ -312,25 +330,28 @@ def generate(topic: str, song_query: str):
     print(f"  dir:   {slug}/\n")
 
     song_path = download_song(songs_dir, song_query)
-    start = find_energetic_30s(song_path)
-    print(f"  segment: {start}s - {start + 30}s")
+    start = find_energetic_segment(song_path, duration)
+    print(f"  segment: {start}s - {start + duration}s")
 
     seg_path = project_dir / "song_30s.wav"
-    extract_30s(song_path, seg_path, start)
+    extract_segment(song_path, seg_path, start, duration)
 
-    beats = detect_beats(seg_path)
-    trans = pick_transitions(beats)
-    print(f"  transitions: {', '.join(f'{t:.1f}s' for t in trans)}")
+    beats = detect_beats(seg_path, duration)
 
-    clips = download_clips(project_dir, topic)
+    n_clips = max(5, int(duration // 7))
+    n_trans = n_clips - 1
+    trans = pick_transitions(beats, n_trans, duration)
+    print(f"  transitions ({n_trans}): {', '.join(f'{t:.1f}s' for t in trans)}")
+
+    clips = download_clips(project_dir, topic, n_clips)
     durs = []
     prev = 0.0
     for bt in trans:
         durs.append(bt - prev + 0.5)
         prev = bt
-    durs.append(max(0.5, 30 - prev))
+    durs.append(max(0.5, duration - prev))
 
-    fg = build_filter(clips, trans, durs)
+    fg = build_filter(clips, trans, durs, duration)
 
     inputs = []
     for c in clips:
@@ -346,7 +367,7 @@ def generate(topic: str, song_query: str):
         "-c:a", "aac", "-b:a", "192k",
         "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         "-threads", "0",
-        "-t", "30", str(out_path),
+        "-t", str(duration), str(out_path),
     ], capture_output=True, text=True, timeout=600)
 
     if r.returncode != 0:
@@ -359,7 +380,7 @@ def generate(topic: str, song_query: str):
                 "-c:v", "h264_videotoolbox", "-q:v", "65",
                 "-c:a", "aac", "-b:a", "192k",
                 "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-                "-t", "30", str(out_path),
+                "-t", str(duration), str(out_path),
             ], capture_output=True, text=True, timeout=600)
         if r.returncode != 0:
             print(f"  failed: {r.stderr.strip()[-300:]}")
@@ -367,7 +388,7 @@ def generate(topic: str, song_query: str):
 
     size_mb = out_path.stat().st_size / (1024 * 1024)
     print(f"\n  done: {out_name} ({size_mb:.0f} MB)")
-    print(f"  {len(clips)} clips, {len(trans)} transitions")
+    print(f"  {len(clips)} clips, {len(trans)} transitions, {duration:.0f}s")
 
 
 def init_csv():
@@ -401,7 +422,6 @@ def batch_csv(csv_path: str):
         print(f"\n{'='*60}")
         print(f"[{row['id']}] {row['topic']} × {row['song']}")
         generate(row["topic"].strip(), row["song"].strip())
-        # mark done
         row["status"] = "done"
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=rows[0].keys())
@@ -413,10 +433,12 @@ def batch_csv(csv_path: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate ~30s montage videos from YouTube clips timed to music."
+        description="Generate montage videos from YouTube clips timed to music."
     )
     parser.add_argument("--topic", "-t", help="Video topic to search")
     parser.add_argument("--song", "-s", help="Song for soundtrack")
+    parser.add_argument("--duration", "-d", type=float, default=60.0,
+                        help="Target duration in seconds (default: 60)")
     parser.add_argument("--init-csv", action="store_true", help="Create prompts.csv with 10 combos")
     parser.add_argument("--csv", help="Batch-process all entries in prompts.csv")
     args = parser.parse_args()
@@ -430,7 +452,7 @@ def main():
         batch_csv(args.csv)
         return
     if args.topic and args.song:
-        generate(args.topic, args.song)
+        generate(args.topic, args.song, args.duration)
         return
     parser.print_help()
 
