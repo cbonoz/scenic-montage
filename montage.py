@@ -297,14 +297,14 @@ def build_filter(clips: list[Path], trans: list[float], durs: list[float], durat
             f"format=yuv420p[{ol}]"
         )
         out = ol
-    fade_end = trans[-1] + 0.5 if trans else duration - 1
+    fade_end = duration - 0.5
     lines.append(
-        f"[{out}]fade=t=in:st=0:d=1,fade=t=out:st={fade_end}:d=1,"
+        f"[{out}]fade=t=in:st=0:d=1,fade=t=out:st={fade_end}:d=0.5,"
         f"format=yuv420p[video]"
     )
     lines.append(
         f"[{len(clips)}:a]alimiter=limit=0.9,"
-        f"afade=t=in:st=0:d=1.5,afade=t=out:st={duration - 1.5}:d=1.5[a]"
+        f"afade=t=in:st=0:d=1.5,afade=t=out:st={duration - 0.75}:d=0.75[a]"
     )
     return ";\n".join(lines)
 
